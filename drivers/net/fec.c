@@ -575,12 +575,6 @@ static int fec_enet_rx(struct net_device *ndev)
 #endif
 		packet_cnt++;
 
-		/* Since we have allocated space to hold a complete frame,
-		 * the last indicator should be set.
-		 */
-		if ((status & BD_ENET_RX_LAST) == 0)
-			dev_err(&ndev->dev, "FEC ENET: rcv is not +last\n");
-
 		/* Check for errors. */
 		status ^= BD_ENET_RX_LAST;
 		if (status & (BD_ENET_RX_LG | BD_ENET_RX_SH | BD_ENET_RX_NO |
