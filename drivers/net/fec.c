@@ -1654,24 +1654,20 @@ fec_restart(struct net_device *dev, int duplex)
 		enctrl |= (0x1 << 5);
 
 	if (cpu_is_mx6q() || cpu_is_mx6dl()) {
-		u32 rsem_val = 0;
+		u32 rsem_val = FEC_ENET_RSEM_V;
+		u32 rsfl_val = FEC_ENET_RSFL_V;
 		/* RX FIFO threshold setting for ENET pause frame feature
 		 * Only set the parameters after ticket TKT116501 fixed.
 		 * The issue has been fixed on Rigel TO1.1 and Arik TO1.2
 		 */
-		if (cpu_is_mx6q() || (cpu_is_mx6dl()
-				&& (mx6dl_revision() >= IMX_CHIP_REVISION_1_1))) {
-			if (cpu_is_mx6q() && (mx6q_revision() < IMX_CHIP_REVISION_1_1)) {
-                                rsem_val = FEC_ENET_RSEM_V_TO1;
-			} else
-                                rsem_val = FEC_ENET_RSEM_V;
+		if ((cpu_is_mx6q() && (mx6q_revision() < IMX_CHIP_REVISION_1_1)) ||
+				(cpu_is_mx6dl() && (mx6dl_revision() < IMX_CHIP_REVISION_1_1))) {
+			rsem_val = FEC_ENET_RSEM_V_TO1;
+			rsfl_val = FEC_ENET_RSFL_V_TO1;
 		}
 
 		writel(rsem_val, fep->hwp + FEC_R_FIFO_RSEM);
-		if (cpu_is_mx6q() && (mx6q_revision() < IMX_CHIP_REVISION_1_1))
-			writel(FEC_ENET_RSFL_V_TO1, fep->hwp + FEC_R_FIFO_RSFL);
-		else
-			writel(FEC_ENET_RSFL_V, fep->hwp + FEC_R_FIFO_RSFL);
+		writel(rsfl_val, fep->hwp + FEC_R_FIFO_RSFL);
 		writel(FEC_ENET_RAEM_V, fep->hwp + FEC_R_FIFO_RAEM);
 		writel(FEC_ENET_RAFL_V, fep->hwp + FEC_R_FIFO_RAFL);
 
