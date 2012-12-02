@@ -1211,6 +1211,8 @@ static int fec_enet_alloc_buffers(struct net_device *ndev)
 		bdp->cbd_sc = BD_ENET_RX_EMPTY;
 #ifdef CONFIG_ENHANCED_BD
 		bdp->cbd_esc = BD_ENET_RX_INT;
+		bdp->cbd_prot = 0;
+		bdp->cbd_bdu = 0;
 #endif
 		bdp++;
 	}
