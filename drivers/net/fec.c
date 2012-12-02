@@ -286,6 +286,7 @@ fec_enet_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 	unsigned long   estatus;
 	unsigned long flags;
 	uint tx_offset;
+	uint len;
 
 	spin_lock_irqsave(&fep->hw_lock, flags);
 	if (!fep->link) {
@@ -310,7 +311,7 @@ fec_enet_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 
 	/* Set buffer length and buffer pointer */
 	bufaddr = skb->data;
-	bdp->cbd_datlen = skb->len;
+	bdp->cbd_datlen = len = skb->len;
 
 	tx_offset = ((unsigned long)bufaddr) & (FEC_TX_ALIGNMENT - 1);
 #ifdef CONFIG_FEC_DEBUG
@@ -324,7 +325,7 @@ fec_enet_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 	if (tx_offset) {
 		bufaddr = fep->tx_aligned_bounce + (fep->tx_insert
 				* FEC_ENET_TX_SPACE);
-		memcpy(bufaddr, (void *)skb->data, skb->len);
+		memcpy(bufaddr, (void *)skb->data, len);
 	}
 
 	/*
@@ -358,7 +359,7 @@ fec_enet_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 	 * data.
 	 */
 	bdp->cbd_bufaddr = dma_map_single(&fep->pdev->dev, bufaddr,
-			FEC_ENET_TX_FRSIZE, DMA_TO_DEVICE);
+			len, DMA_TO_DEVICE);
 
 	/* Save skb pointer */
 	fep->tx_skbuff[fep->tx_insert++] = skb;
@@ -430,7 +431,7 @@ static int fec_enet_tx(struct net_device *ndev)
 
 		if (bdp->cbd_bufaddr)
 			dma_unmap_single(&fep->pdev->dev, bdp->cbd_bufaddr,
-				FEC_ENET_TX_FRSIZE, DMA_TO_DEVICE);
+					bdp->cbd_datlen, DMA_TO_DEVICE);
 		bdp->cbd_bufaddr = 0;
 
 		skb = fep->tx_skbuff[fep->tx_remove];
