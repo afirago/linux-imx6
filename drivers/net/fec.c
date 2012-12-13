@@ -49,6 +49,7 @@
 #include <linux/debugfs.h>
 
 #include <asm/cacheflush.h>
+#define CONFIG_THROTTLE
 
 #ifndef CONFIG_ARM
 #include <asm/coldfire.h>
@@ -73,8 +74,14 @@
 /* Controller needs driver to swap frame */
 #define FEC_QUIRK_SWAP_FRAME		(1 << 1)
 
-static int rx_pause_level;
-module_param(rx_pause_level, int, S_IRUGO | S_IWUSR);
+#ifdef CONFIG_THROTTLE
+static unsigned rx_throttle_level;
+module_param(rx_throttle_level, uint, S_IRUGO | S_IWUSR);
+#endif
+static unsigned enet_rsfl;
+module_param(enet_rsfl, uint, S_IRUGO | S_IWUSR);
+static unsigned enet_rsem;
+module_param(enet_rsem, uint, S_IRUGO | S_IWUSR);
 
 static struct platform_device_id fec_devtype[] = {
 	{
@@ -140,7 +147,6 @@ MODULE_PARM_DESC(macaddr, "FEC Ethernet MAC address");
 #define FEC_ENET_MII_CLK       ((uint)2500000)
 #define FEC_ENET_HOLD_TIME     ((uint)0x100)  /* 2 internal clock cycle*/
 
-#define FEC_DEFAULT_IMASK (FEC_ENET_TXF | FEC_ENET_RXF | FEC_ENET_MII)
 #if defined(CONFIG_FEC_1588)
 #define FEC_1588_IMASK	  (FEC_ENET_TS_AVAIL | FEC_ENET_TS_TIMER)
 #else
@@ -156,13 +162,23 @@ MODULE_PARM_DESC(macaddr, "FEC Ethernet MAC address");
 /* Pause frame feild and FIFO threshold */
 #define TCR_TFC_PAUSE		0x0008
 #define FEC_ENET_FCE		(1 << 5)
-#define FEC_ENET_RSEM_V		0x84
-#define FEC_ENET_RSEM_V_TO1	0x10
-#define FEC_ENET_RSFL_V		16
-#define FEC_ENET_RSFL_V_TO1     0x20
+#define RSEM_SLOW		0x1
+#define FEC_ENET_RSEM_V		0xB4
+#define FEC_ENET_RSEM_V_TO1	0x26
+/*
+ * For TO1.0, good rsem,rsfl pairs are
+ *(0x07,0x08)(0x08,0x0b)(0x09,0x0d)(0x0a,0x0d)
+ *(0x0b,0x0e)(0x0c,0x0f)(0x0d,0x10)(0x0e,0x11)
+ *(0x0f,0x12)(0x10,0x13)(0x11,0x14)(0x12,0x15)
+ *(0x13,0x16)(0x14,0x13)(0x15,0x14)(0x16,0x15)
+ *(0x14,0x17)(0x26,0x29)
+ */
+#define RSFL_SLOW		0xc0
+#define FEC_ENET_RSFL_V		0x10
+#define FEC_ENET_RSFL_V_TO1     0x2b
 #define FEC_ENET_RAEM_V		0x8
 #define FEC_ENET_RAFL_V		0x8
-#define FEC_ENET_OPD_V		0xFFF0
+#define FEC_ENET_OPD_V		0xfff0
 
 /*
  * The 5270/5271/5280/5282/532x RX control register also contains maximum frame
@@ -224,6 +240,13 @@ struct fec_enet_private {
 	int	index;
 	int	link;
 	int	full_duplex;
+	u32	rsfl_val;
+	char	throttle_allowed;
+#ifdef CONFIG_THROTTLE
+	char	throttle_rsfl;
+	char	throttle_rsem;
+#endif
+	char	rx_int_on;
 	struct	completion mdio_done;
 
 	struct  fec_ptp_private *ptp_priv;
@@ -240,10 +263,21 @@ struct fec_enet_private {
 	struct dentry *dbgfs_root;
 	struct dentry *dbgfs_state;
 	uint	rx_overrun;
-	uint	rx_overrun_status;
 	uint	max_rx_packet_cnt;
 	uint	max_tx_packet_cnt;
+#ifdef CONFIG_THROTTLE
+	uint	rx_throttle_rsem_cnt;
+	uint	rx_throttle_rsfl_cnt;
+#endif
+	uint	rx_full_cnt;
+	uint	rx_poll_cnt;
 	uint	rx_pkt_count;
+	uint	int_cnt_rx;
+	uint	int_cnt_tx;
+	uint	int_cnt_mii;
+	uint	int_cnt_ts_timer;
+	uint	int_cnt_eberr;
+	uint	int_cnt_all;
 	uint	tx_offset_cnt[FEC_TX_ALIGNMENT];
 #endif
 };
@@ -403,6 +437,7 @@ fec_rx_int_is_enabled(struct net_device *ndev, bool enabled)
 	else
 		int_events &= ~FEC_ENET_RXF;
 	writel(int_events, fep->hwp + FEC_IMASK);
+	fep->rx_int_on = enabled;
 }
 #endif
 
@@ -538,6 +573,28 @@ static void fec_timeout(struct net_device *ndev)
 		netif_wake_queue(ndev);
 }
 
+/* return 0 if data available */
+static int check_rx_empty(struct fec_enet_private *fep)
+{
+	struct bufdesc *bdp = fep->rx_bd_base + fep->cur_rx;
+	return (bdp->cbd_sc & BD_ENET_RX_EMPTY);
+}
+
+static int descriptor_empty(struct fec_enet_private *fep, unsigned index)
+{
+	struct bufdesc *bdp;
+	if (index >= RX_RING_SIZE)
+		index -= RX_RING_SIZE;
+	bdp = fep->rx_bd_base + index;
+	return (bdp->cbd_sc & BD_ENET_RX_EMPTY);
+}
+
+
+#ifdef CONFIG_FEC_DEBUG
+#define INC_CNT(var) var++
+#else
+#define INC_CNT(var)
+#endif
 /* During a receive, the cur_rx points to the current incoming buffer.
  * When we update through the ring, if the next incoming buffer has
  * not been given to the system, we just set the empty indicator,
@@ -551,9 +608,8 @@ static int fec_rx_poll(struct napi_struct *napi, int budget)
 		container_of(napi, struct fec_enet_private, napi);
 	struct net_device *ndev = napi->dev;
 #else
-static int fec_enet_rx(struct net_device *ndev)
+static int fec_enet_rx(struct net_device *ndev, struct fec_enet_private *fep)
 {
-	struct fec_enet_private *fep = netdev_priv(ndev);
 #endif
 	struct  fec_ptp_private *fpp = fep->ptp_priv;
 	const struct platform_device_id *id_entry =
@@ -563,8 +619,9 @@ static int fec_enet_rx(struct net_device *ndev)
 	struct	sk_buff	*skb;
 	ushort	pkt_len;
 	uint cur_rx;
-	int packet_cnt = 0;
+	unsigned packet_cnt = 0;
 
+	cur_rx = fep->cur_rx;
 #ifdef CONFIG_FEC_NAPI
 	WARN_ON(!budget);
 #endif
@@ -572,29 +629,77 @@ static int fec_enet_rx(struct net_device *ndev)
 #ifdef CONFIG_M532x
 	flush_cache_all();
 #endif
-
-	/* First, grab all of the stats for the incoming packet.
-	 * These get messed up if we get called due to a busy condition.
-	 */
-	cur_rx = fep->cur_rx;
+#if defined(CONFIG_FEC_NAPI) && defined(CONFIG_THROTTLE)
+	if (fep->throttle_allowed) {
+		if ((rx_throttle_level < RX_RING_SIZE)
+				&& descriptor_empty(fep,
+					cur_rx + rx_throttle_level)) {
+			/*
+			 * Release throttle,
+			 * Speed interface back up
+			 */
+			writel(enet_rsfl, fep->hwp + FEC_R_FIFO_RSFL);
+			fep->throttle_rsfl = 0;
+			writel(enet_rsem, fep->hwp + FEC_R_FIFO_RSEM);
+			fep->throttle_rsem = 0;
+		} else {
+			/*
+			 * Interrupt routine throttles rsem,rsfl
+			 * we just keep it throttled
+			 */
+			INC_CNT(fep->rx_throttle_rsem_cnt);
+			if (descriptor_empty(fep,
+					cur_rx + (RX_RING_SIZE - 64))) {
+				writel(enet_rsfl, fep->hwp + FEC_R_FIFO_RSFL);
+				fep->throttle_rsfl = 0;
+			} else {
+				INC_CNT(fep->rx_throttle_rsfl_cnt);
+				if (!descriptor_empty(fep,
+						cur_rx + (RX_RING_SIZE - 1))) {
+					/*
+					 * The receiver may have dropped
+					 * our xoff, resend
+					 */
+					INC_CNT(fep->rx_full_cnt);
+					writel(TCR_TFC_PAUSE |
+						fep->full_duplex ? 4 : 0,
+						fep->hwp + FEC_X_CNTRL);
+				}
+			}
+		}
+	}
+#else
+	if (!descriptor_empty(fep,
+			cur_rx + (RX_RING_SIZE - 1))) {
+		/*
+		 * The receiver may have dropped
+		 * our xoff, resend
+		 */
+		INC_CNT(fep->rx_full_cnt);
+		if (fep->throttle_allowed) {
+			writel(TCR_TFC_PAUSE |
+					fep->full_duplex ? 4 : 0,
+							fep->hwp + FEC_X_CNTRL);
+		}
+	}
+#endif
+	INC_CNT(fep->rx_poll_cnt);
 	bdp = fep->rx_bd_base + cur_rx;
 
-	while (!((status = bdp->cbd_sc) & BD_ENET_RX_EMPTY)) {
-		struct	sk_buff	*rx_skb = fep->rx_skbuff[cur_rx];
-
-		if (!rx_skb)
-			break;
+	for (;;) {
+		struct	sk_buff	*rx_skb;
+		status = bdp->cbd_sc;
+		if (status & BD_ENET_RX_EMPTY) {
+			writel(FEC_ENET_RXF, fep->hwp + FEC_IEVENT);
+			status = bdp->cbd_sc;
+			if (status & BD_ENET_RX_EMPTY)
+				break;
+		}
 #ifdef CONFIG_FEC_NAPI
 		if (packet_cnt >= budget)
 			break;
 #endif
 		packet_cnt++;
-		if ((packet_cnt >= rx_pause_level)
-				&& (fep->phy_dev->supported & SUPPORTED_Pause)
-				&& (((packet_cnt - rx_pause_level) & 0x7) == 0))
-			writel(fep->full_duplex ? 4 | TCR_TFC_PAUSE
-				: TCR_TFC_PAUSE, fep->hwp + FEC_X_CNTRL);
-
 		/* Check for errors. */
 		status ^= BD_ENET_RX_LAST;
 		if (status & (BD_ENET_RX_LG | BD_ENET_RX_SH | BD_ENET_RX_NO |
@@ -605,10 +710,16 @@ static int fec_enet_rx(struct net_device *ndev)
 			if (status & BD_ENET_RX_OV) {
 				/* FIFO overrun */
 				ndev->stats.rx_fifo_errors++;
-#ifdef CONFIG_FEC_DEBUG
-				fep->rx_overrun_status = status;
-				fep->rx_overrun++;
-#endif
+				INC_CNT(fep->rx_overrun);
+				if (fep->throttle_allowed) {
+					/*
+					 * The receiver may have dropped
+					 * our xoff, resend
+					 */
+					writel(TCR_TFC_PAUSE |
+						fep->full_duplex ? 4 : 0,
+						fep->hwp + FEC_X_CNTRL);
+				}
 			} else {
 				if (status & (BD_ENET_RX_LG | BD_ENET_RX_SH
 						| BD_ENET_RX_LAST)) {
@@ -629,7 +740,27 @@ static int fec_enet_rx(struct net_device *ndev)
 			}
 			goto rx_processing_done;
 		}
-
+#if !defined(CONFIG_FEC_NAPI) && defined(CONFIG_THROTTLE)
+		if (fep->throttle_allowed) {
+			if ((!fep->throttle_rsem && (rx_throttle_level < RX_RING_SIZE)) {
+				if (!descriptor_empty(fep, cur_rx + rx_throttle_level)) {
+					INC_CNT(fep->rx_throttle_rsem_cnt);
+					fep->throttle_rsem = 1;
+					/*
+					 * Since auto flow control interferes
+					 * with pause, let's reduce the transfer
+					 * rate by delaying xon
+					 * until fifo is nearly empty.
+					 */
+					writel(RSEM_SLOW, fep->hwp + FEC_R_FIFO_RSEM);
+				}
+			} else if (!fep->throttle_rsfl && !descriptor_empty(fep, cur_rx + (RX_RING_SIZE - 64))) {
+				INC_CNT(fep->rx_throttle_rsfl_cnt);
+				fep->throttle_rsfl = 1;
+				writel(RSFL_SLOW, fep->hwp + FEC_R_FIFO_RSFL);
+			}
+		}
+#endif
 		/* Process the incoming frame. */
 		ndev->stats.rx_packets++;
 		pkt_len = bdp->cbd_datlen;
@@ -640,6 +771,9 @@ static int fec_enet_rx(struct net_device *ndev)
 					pkt_len, DMA_FROM_DEVICE);
 
 		pkt_len -= RX_SHIFT_PAD;
+		rx_skb = fep->rx_skbuff[cur_rx];
+		if (!rx_skb)
+			break;
 		if (id_entry->driver_data & FEC_QUIRK_SWAP_FRAME)
 			swap_buffer(rx_skb->data + RX_SHIFT_PAD, pkt_len);
 
@@ -654,7 +788,7 @@ static int fec_enet_rx(struct net_device *ndev)
 			dev_err(&ndev->dev,
 					"Memory squeeze, dropping packet.\n");
 			ndev->stats.rx_dropped++;
-			skb = fep->rx_skbuff[cur_rx];
+			skb = rx_skb;
 		} else {
 			uint skip = (-((uint)skb->data)) & 0x3f;
 
@@ -709,9 +843,7 @@ rx_processing_done:
 		bdp->cbd_prot = 0;
 		bdp->cbd_bdu = 0;
 #endif
-#ifdef CONFIG_FEC_DEBUG
-		fep->rx_pkt_count++;
-#endif
+		INC_CNT(fep->rx_pkt_count);
 
 		mb();
 		/* Update BD pointer to next entry */
@@ -736,12 +868,41 @@ rx_processing_done:
 		if (fep->max_rx_packet_cnt < packet_cnt)
 			fep->max_rx_packet_cnt = packet_cnt;
 #endif
-	}
 #ifdef CONFIG_FEC_NAPI
-	if (packet_cnt < budget) {
-		napi_complete(napi);
-		fec_rx_int_is_enabled(ndev, true);
+		if (packet_cnt >= budget) {
+#ifdef CONFIG_THROTTLE
+			if (fep->throttle_allowed) {
+				if (!fep->throttle_rsem) {
+					fep->throttle_rsem = 1;
+					writel(RSEM_SLOW, fep->hwp + FEC_R_FIFO_RSEM);
+				}
+				if (!fep->throttle_rsfl) {
+					fep->throttle_rsfl = 1;
+					writel(RSFL_SLOW, fep->hwp + FEC_R_FIFO_RSFL);
+				}
+			}
+#endif
+			return packet_cnt;
+		}
+#endif
 	}
+#ifdef CONFIG_THROTTLE
+	/*
+	 * Release throttle,
+	 * Speed interface back up
+	 */
+	if (fep->throttle_rsem) {
+		writel(enet_rsem, fep->hwp + FEC_R_FIFO_RSEM);
+		fep->throttle_rsem = 0;
+	}
+	if (fep->throttle_rsfl) {
+		writel(enet_rsfl, fep->hwp + FEC_R_FIFO_RSFL);
+		fep->throttle_rsfl = 0;
+	}
+#endif
+#ifdef CONFIG_FEC_NAPI
+	napi_complete(napi);
+	fec_rx_int_is_enabled(ndev, true);
 #endif
 	return packet_cnt;
 }
@@ -766,6 +927,12 @@ static void check_for_rxf(struct fec_enet_private *fep, struct net_device *ndev,
 }
 #endif
 
+#ifdef CONFIG_FEC_DEBUG
+#define INC_RET(ret, cnt) if (ret == IRQ_NONE) cnt++;
+#else
+#define INC_RET(ret, cnt)
+#endif
+
 static irqreturn_t
 fec_enet_interrupt(int irq, void *dev_id)
 {
@@ -776,6 +943,7 @@ fec_enet_interrupt(int irq, void *dev_id)
 	ulong flags;
 	irqreturn_t ret = IRQ_NONE;
 
+	INC_RET(ret, fep->int_cnt_all);
 	for (;;) {
 		int_events = readl(fep->hwp + FEC_IEVENT);
 		if (!int_events)
@@ -783,6 +951,7 @@ fec_enet_interrupt(int irq, void *dev_id)
 		writel(int_events, fep->hwp + FEC_IEVENT);
 
 		if (int_events & FEC_ENET_MII) {
+			INC_RET(ret, fep->int_cnt_mii);
 			ret = IRQ_HANDLED;
 			complete(&fep->mdio_done);
 			/*
@@ -791,28 +960,35 @@ fec_enet_interrupt(int irq, void *dev_id)
 			 */
 			int_events |= FEC_ENET_RXF | FEC_ENET_TXF;
 		}
+		if (fep->rx_int_on) {
+			if (!check_rx_empty(fep)) {
+				INC_RET(ret, fep->int_cnt_rx);
+				ret = IRQ_HANDLED;
+				spin_lock_irqsave(&fep->hw_lock, flags);
 #ifdef CONFIG_FEC_NAPI
-		if (int_events & FEC_ENET_RXF) {
-			ret = IRQ_HANDLED;
-			spin_lock_irqsave(&fep->hw_lock, flags);
-
-			/* Disable the RX interrupt */
-			if (napi_schedule_prep(&fep->napi)) {
-				fec_rx_int_is_enabled(ndev, false);
-				__napi_schedule(&fep->napi);
-			}
-			spin_unlock_irqrestore(&fep->hw_lock, flags);
-		}
-#else
-		spin_lock_irqsave(&fep->hw_lock, flags);
-		if (fec_enet_rx(ndev)) {
-			ret = IRQ_HANDLED;
-			check_for_rxf(fep, ndev, int_events);
-		} else if (int_events & FEC_ENET_RXF) {
-			ret = IRQ_HANDLED;
-		}
-		spin_unlock_irqrestore(&fep->hw_lock, flags);
+#ifdef CONFIG_THROTTLE
+				if (fep->throttle_allowed) {
+					fep->throttle_rsem = 1;
+					writel(RSEM_SLOW, fep->hwp + FEC_R_FIFO_RSEM);
+					fep->throttle_rsfl = 1;
+					writel(RSFL_SLOW, fep->hwp + FEC_R_FIFO_RSFL);
+				}
 #endif
+				/* Disable the RX interrupt */
+				if (napi_schedule_prep(&fep->napi)) {
+					fec_rx_int_is_enabled(ndev, false);
+					__napi_schedule(&fep->napi);
+				}
+#else
+				fec_enet_rx(ndev, fep);
+				check_for_rxf(fep, ndev, int_events);
+#endif
+				spin_unlock_irqrestore(&fep->hw_lock, flags);
+			} else if (int_events & FEC_ENET_RXF) {
+				INC_RET(ret, fep->int_cnt_rx);
+				ret = IRQ_HANDLED;
+			}
+		}
 		fep->prev_ievent = int_events;
 
 		/* Transmit OK, or non-fatal error. Update the buffer
@@ -820,17 +996,20 @@ fec_enet_interrupt(int irq, void *dev_id)
 		 * them as part of the transmit process.
 		 */
 		if (int_events & FEC_ENET_TXF) {
+			INC_RET(ret, fep->int_cnt_tx);
 			ret = IRQ_HANDLED;
 			fec_enet_tx(ndev);
 		}
 
 		if (int_events & FEC_ENET_TS_TIMER) {
+			INC_RET(ret, fep->int_cnt_ts_timer);
 			ret = IRQ_HANDLED;
 			if (fep->ptimer_present && fpp)
 				fpp->prtc++;
 		}
 
 		if (int_events & FEC_ENET_EBERR) {
+			INC_RET(ret, fep->int_cnt_eberr);
 			WARN_ONCE(1, "bus error\n");
 		}
 	}
@@ -1638,6 +1817,9 @@ fec_restart(struct net_device *dev, int duplex)
 	writel(0, fep->hwp + FEC_MIB_CTRLSTAT);
 #endif
 	fep->full_duplex = duplex;
+	fep->throttle_allowed = (fep->phy_dev
+		&& (!(fep->phy_dev->supported & SUPPORTED_Pause))) ? 0 : 1;
+
 
 	/* Set MII speed */
 	writel(fep->phy_speed, fep->hwp + FEC_MII_SPEED);
@@ -1725,7 +1907,8 @@ fec_restart(struct net_device *dev, int duplex)
 			rsem_val = FEC_ENET_RSEM_V_TO1;
 			rsfl_val = FEC_ENET_RSFL_V_TO1;
 		}
-
+		enet_rsem = rsem_val;
+		enet_rsfl = rsfl_val;
 		writel(rsem_val, fep->hwp + FEC_R_FIFO_RSEM);
 		writel(rsfl_val, fep->hwp + FEC_R_FIFO_RSFL);
 		writel(FEC_ENET_RAEM_V, fep->hwp + FEC_R_FIFO_RAEM);
@@ -1744,10 +1927,12 @@ fec_restart(struct net_device *dev, int duplex)
 	writel(0, fep->hwp + FEC_R_DES_ACTIVE);
 
 	/* Enable interrupts we wish to service */
+	fep->rx_int_on = fep->rx_skbuff[0] ? 1 : 0;
+	imask = FEC_ENET_TXF | FEC_ENET_MII;
+	if (fep->rx_int_on)
+		imask |= FEC_ENET_RXF;
 	if (cpu_is_mx6q() || cpu_is_mx6dl() || cpu_is_mx2() || cpu_is_mx3())
-		imask = FEC_DEFAULT_IMASK | FEC_1588_IMASK | FEC_ENET_EBERR;
-	else
-		imask = FEC_DEFAULT_IMASK;
+		imask |= FEC_1588_IMASK | FEC_ENET_EBERR;
 	writel(imask, fep->hwp + FEC_IMASK);
 }
 
@@ -1763,7 +1948,7 @@ fec_stop(struct net_device *dev)
 		if (!(readl(fep->hwp + FEC_IEVENT) & FEC_ENET_GRA))
 			printk("fec_stop : Graceful transmit stop did not complete !\n");
 	}
-
+	fep->rx_int_on = 0;
 	/* Whack a reset.  We should wait for this. */
 	writel(1, fep->hwp + FEC_ECNTRL);
 	udelay(10);
@@ -1775,7 +1960,7 @@ fec_stop(struct net_device *dev)
 	writel(fep->phy_speed, fep->hwp + FEC_MII_SPEED);
 	if (fep->ptimer_present)
 		fec_ptp_stop(fep->ptp_priv);
-	writel(FEC_DEFAULT_IMASK, fep->hwp + FEC_IMASK);
+	writel(FEC_ENET_MII, fep->hwp + FEC_IMASK);
 
 	if (netif_running(dev))
 		netif_stop_queue(dev);
@@ -1797,25 +1982,63 @@ static ssize_t dbgfs_state_read(struct file *file, char __user *user_buf,
 	int len = 0 ;
 
 	if (fep) {
-		uint i, j, k, l;
+		uint a, b, c, d;
+#ifdef CONFIG_THROTTLE
+		uint e, f;
+#endif
+		uint g, h, i1, i2, i3, i4, i5, i6;
 		uint t[FEC_TX_ALIGNMENT];
 		uint *p = t;
 		char buf[256];
 		int cnt = sizeof(buf);
 
-		i = fep->rx_overrun;
-		j = fep->max_rx_packet_cnt;
-		k = fep->max_tx_packet_cnt;
-		l = fep->rx_pkt_count;
+		a = fep->rx_overrun;
+		b = fep->max_rx_packet_cnt;
+		c = fep->max_tx_packet_cnt;
+		d = fep->rx_pkt_count;
+#ifdef CONFIG_THROTTLE
+		e = fep->rx_throttle_rsem_cnt;
+		f = fep->rx_throttle_rsfl_cnt;
+#endif
+		g = fep->rx_full_cnt;
+		h = fep->rx_poll_cnt;
+		i1 = fep->int_cnt_rx;
+		i2 = fep->int_cnt_tx;
+		i3 = fep->int_cnt_mii;
+		i4 = fep->int_cnt_ts_timer;
+		i5 = fep->int_cnt_eberr;
+		i6 = fep->int_cnt_all;
 		memcpy(t, fep->tx_offset_cnt, sizeof(t));
 		fep->rx_overrun = 0;
 		fep->max_rx_packet_cnt = 0;
 		fep->max_tx_packet_cnt = 0;
 		fep->rx_pkt_count = 0;
+#ifdef CONFIG_THROTTLE
+		fep->rx_throttle_rsem_cnt = 0;
+		fep->rx_throttle_rsfl_cnt = 0;
+#endif
+		fep->rx_full_cnt = 0;
+		fep->rx_poll_cnt = 0;
+		fep->int_cnt_rx = 0;
+		fep->int_cnt_tx = 0;
+		fep->int_cnt_mii = 0;
+		fep->int_cnt_ts_timer = 0;
+		fep->int_cnt_eberr = 0;
+		fep->int_cnt_all = 0;
 		memset(fep->tx_offset_cnt, 0, sizeof(fep->tx_offset_cnt));
-		len = snprintf(buf, cnt, "%d 0x%x %d %d %d",
-				i, fep->rx_overrun_status, j, k, l);
-		for (i = 0; i < FEC_TX_ALIGNMENT; i += 4) {
+		len = snprintf(buf, cnt, "%d %d %d %d  "
+#ifdef CONFIG_THROTTLE
+				"%d,%d,"
+#endif
+				"%d/%d %d/%d/%d/%d/%d/%d-%d",
+				a, b, c, d,
+#ifdef CONFIG_THROTTLE
+				e, f,
+#endif
+				g, h,
+				i1, i2, i3, i4, i5, i6,
+				i6 - (i1 + i2 + i3 + i4 + i5));
+		for (a = 0; a < FEC_TX_ALIGNMENT; a += 4) {
 			len += snprintf(buf + len, cnt - len, "   %d %d %d %d",
 					p[0], p[1], p[2], p[3]);
 			p += 4;
@@ -1868,8 +2091,10 @@ fec_probe(struct platform_device *pdev)
 
 	fep->hwp = ioremap(r->start, resource_size(r));
 	fep->pdev = pdev;
-	if (!rx_pause_level)
-		rx_pause_level = RX_RING_SIZE / 2;
+#ifdef CONFIG_THROTTLE
+	if (!rx_throttle_level)
+		rx_throttle_level = 64;
+#endif
 
 	if (!fep->hwp) {
 		ret = -ENOMEM;
